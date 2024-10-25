@@ -20,7 +20,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const extractCategoriesFromText = async (data) => {
-	console.log("extractCategoriesFromText");
 	const response = await openai.chat.completions.create({
 		model: "gpt-4o",
 		messages: [
@@ -32,10 +31,10 @@ const extractCategoriesFromText = async (data) => {
 			{
 				role: "user",
 				content: `Extract or predict the following information from the given the data:
-  - Side effects: what are the possible side efffect of the medication.
+  							- Side effects: what are the possible side efffect of the medication.
   
-  Data:
-  ${data}`,
+							Data:
+							${data}`,
 			},
 		],
 		response_format: {
@@ -58,12 +57,10 @@ const extractCategoriesFromText = async (data) => {
 	});
 
 	const extractedData = JSON.parse(response.choices[0].message.content);
-	console.log("extractedData", extractedData);
 	return extractedData;
 };
 
 const generateCategoryEmbeddings = async (categories) => {
-	console.log("generateCategoryEmbeddings");
 	const embeddings = {};
 
 	for (const [category, text] of Object.entries(categories)) {
@@ -78,20 +75,14 @@ const generateCategoryEmbeddings = async (categories) => {
 
 const parseCSVFile = (csvPath, columns) => {
 	return new Promise((resolve, reject) => {
-		const data = new Set();
-		let count = 0;
+		const data = [];
 
 		fs.createReadStream(csvPath)
 			.pipe(csv())
-			.on("data", (row) => {
-				count++;
-				const text = columns
-					.map((col) => `${col}: ${row[col]}`)
-					.join(". ");
-				data.add(text);
-			})
+			.on("data", (row) => data.push(row))
+
 			.on("end", () => {
-				resolve(Array.from(data));
+				resolve(data);
 			})
 			.on("error", (err) => {
 				reject(err);
@@ -100,10 +91,9 @@ const parseCSVFile = (csvPath, columns) => {
 };
 
 const storeEmbeddingsInPinecone = async (medicines) => {
-	console.log("storeEmbeddingsInPinecone");
 	for (let i = 0; i < medicines.length; i++) {
 		const med = medicines[i];
-		const categories = await extractCategoriesFromText(med);
+		const categories = await extractCategoriesFromText(JSON.stringify(med));
 		const categoryEmbeddings = await generateCategoryEmbeddings(categories);
 
 		for (const [category, embedding] of Object.entries(
@@ -113,12 +103,16 @@ const storeEmbeddingsInPinecone = async (medicines) => {
 				{
 					id: `medicine_${i}_${category}`,
 					values: embedding,
-					metadata: { id: i, med, category },
+					metadata: {
+						id: i,
+						name: med.name,
+						content: categories[category],
+						category,
+					},
 				},
 			]);
 		}
 	}
-	console.log("Embeddings generated and stored in Pinecone.");
 };
 
 export async function generateEmbeddings() {
@@ -189,35 +183,83 @@ export async function generateEmbeddings() {
 	];
 
 	const data = await parseCSVFile(csvPath, columns);
-	console.log(data);
 	await storeEmbeddingsInPinecone(data);
 }
 
-const generateResponse = async (queryText, topCandidates) => {
-	console.log("generateResponse");
-	const candidateData = topCandidates.map((candidate) => ({
-		id: candidate[1].id,
-		text: candidate[1].text,
-	}));
-	const candidatesJSON = JSON.stringify(candidateData);
-	const prompt = `User query:
+const generateResponse = async (queryText, topMedicines) => {
+	const medicinesJSON = JSON.stringify(topMedicines);
 
-"${queryText}"
-
-Among the following candidates, identify those who match the user's query the most, and return their 'id' and 'text':
-Candidates:
-${candidatesJSON}
-
-Please provide the matching candidates as a JSON array of objects with keys 'id' and 'text'.`;
+	const prompt = `
+		You are a helpful doctor assistant who needs to identify the medicine that is causing the pacient symptoms. 
+		The medicines that the doctor needs to analyse is : ${medicinesJSON}`;
 
 	const response = await openai.chat.completions.create({
 		model: "gpt-4",
-		messages: [{ role: "user", content: prompt }],
+		messages: [
+			{ role: "user", content: prompt },
+			{
+				role: "user",
+				content: `What medicines corresponde better if the doctor search "${queryText}`,
+			},
+		],
 		max_tokens: 1000,
 	});
 
-	const matchingCandidates = JSON.parse(response.choices[0].message.content);
-	return matchingCandidates;
+	return response.choices[0].message.content;
 };
 
-export async function query() {}
+export async function query(queryText) {
+	const extractedCategories = await extractCategoriesFromText(queryText);
+	const queryEmbeddings = await generateCategoryEmbeddings(
+		extractedCategories
+	);
+	const categories = ["sideEffects"];
+
+	const medicineScores = {};
+	for (const category of categories) {
+		const queryEmbedding = queryEmbeddings[category];
+		const results = await index.query({
+			vector: queryEmbedding,
+			topK: 10,
+			includeMetadata: true,
+			filter: { category },
+		});
+		results.matches.forEach((match) => {
+			medicineScores[match.metadata.id] = medicineScores[
+				match.metadata.id
+			] || {
+				id: match.metadata.id,
+				score: 0,
+				medicine: match.metadata.name,
+				sideEffects: match.metadata.content,
+			};
+
+			medicineScores[match.metadata.id].score += match.score;
+		});
+	}
+
+	const topMedicines = Object.values(medicineScores)
+		.sort((a, b) => b.score - a.score)
+		.slice(0, 10);
+
+	console.log(`Found ${topMedicines.length} top medicines.`);
+	console.log(
+		`Ordered by score: ${topMedicines
+			.map((medicine) => `ID: ${medicine.id}, Score: ${medicine.score}`)
+			.join("\n")}`
+	);
+
+	if (topMedicines.length === 0) {
+		return {
+			status: "notfound",
+			message: "No relevant matches found.",
+		};
+	}
+
+	const detailedResponse = await generateResponse(queryText, topMedicines);
+	return {
+		status: "success",
+		medicines: topMedicines,
+		detailedResponse,
+	};
+}

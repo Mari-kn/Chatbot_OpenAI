@@ -25,16 +25,20 @@ app.post("/generate-embeddings", async (req, res) => {
 	}
 });
 
-// app.post("/query", async (req, res) => {
-// 	const { queryText } = req.body;
-// 	try {
-// 		const data = await query(queryText);
-// 		return res.send(data);
-// 	} catch (error) {
-// 		console.error("Error querying Pinecone:", error);
-// 		res.status(500).send("Error querying Pinecone.");
-// 	}
-// });
+app.post("/query", async (req, res) => {
+	const { queryText } = req.body;
+	try {
+		const data = await query(queryText);
+		return res.send(data);
+	} catch (error) {
+		console.error("Error querying Pinecone:", error);
+		res.status(500).send("Error querying Pinecone.");
+	}
+});
+
+app.get("/query", (req, res) => {
+	res.sendFile(path.join(__dirname, "public", "query.html"));
+});
 
 app.get("/", (req, res) => {
 	res.sendFile(path.join(__dirname, "public", "index.html"));
